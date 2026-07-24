@@ -1,0 +1,64 @@
+# ==========================================
+# Terraform Local State & Cache Exclusions
+# ==========================================
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# ==========================================
+# Sensitive Variable & Credential Files
+# ==========================================
+*.tfvars
+*.tfvars.json
+*.pem
+*.key
+*.crt
+*.pub
+*.json
+!.github/**/*.json
+!scripts/**/*.json
+
+# ==========================================
+# Environment Variables & Local Secrets
+# ==========================================
+.env
+.env.*
+.envrc
+
+# ==========================================
+# Python Virtual Environments & Caches
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+
+# ==========================================
+# OS & IDE System Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
