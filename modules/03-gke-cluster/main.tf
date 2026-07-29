@@ -13,7 +13,7 @@ terraform {
 }
 
 # ------------------------------------------------------------------------------
-# 1. Custom Least-Privilege Node Service Account
+# 1. Dedicated Least-Privilege Node Service Account
 # ------------------------------------------------------------------------------
 resource "google_service_account" "gke_nodes_sa" {
   account_id   = "${var.cluster_name}-node-sa"
@@ -21,7 +21,7 @@ resource "google_service_account" "gke_nodes_sa" {
   project      = var.project_id
 }
 
-# Additive IAM Grants for Node SA
+# IAM Role Bindings for Node SA
 resource "google_project_iam_member" "node_logging" {
   project = var.project_id
   role    = "roles/logging.logWriter"
@@ -40,7 +40,6 @@ resource "google_project_iam_member" "node_artifact_registry" {
   member  = "serviceAccount:${google_service_account.gke_nodes_sa.email}"
 }
 
-# Grant Node SA permission to decrypt boot disks using CMEK
 resource "google_kms_crypto_key_iam_member" "node_disk_decrypter" {
   crypto_key_id = var.gke_disk_key_id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
@@ -51,71 +50,72 @@ resource "google_kms_crypto_key_iam_member" "node_disk_decrypter" {
 # 2. Hardened Private GKE Control Plane
 # ------------------------------------------------------------------------------
 resource "google_container_cluster" "primary" {
-  name     = var.cluster_name
-  location = var.region
-  project  = var.project_id
+  provider = google-beta
 
+  name     = var.cluster_name
+  project  = var.project_id
+  location = var.region
+
+  # Attach to Tier 1 VPC Network & Subnet
   network    = var.network_id
   subnetwork = var.subnet_id
 
-  # Deletes the default unhardened node pool upon creation
+  # Delete the default node pool to replace with hardened pools
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # Layer 4: Dataplane V2 (Cilium eBPF)
-  datapath_provider = "ADVANCED_DATAPATH"
-
-  # IP Allocation Policy for Secondary Ranges
+  # Network & Pod IP Allocation
   ip_allocation_policy {
     cluster_secondary_range_name  = var.pod_ip_range_name
     services_secondary_range_name = var.svc_ip_range_name
   }
 
-  # Private Cluster Configuration
+  # Datapath & Network Policies (eBPF / Dataplane V2)
+  datapath_provider = "ADVANCED_DATAPATH"
+
+  # Private Cluster Network Security Profile
   private_cluster_config {
     enable_private_nodes    = true
-    enable_private_endpoint = false # Control plane endpoint accessible for kubectl
+    enable_private_endpoint = false
     master_ipv4_cidr_block  = var.master_ipv4_cidr_block
   }
 
-  # Layer 6: CMEK Envelope Encryption for etcd Secrets
+  # Workload Identity Federation
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # CMEK Envelope Encryption for Kubernetes Secrets (etcd)
   database_encryption {
     state    = "ENCRYPTED"
     key_name = var.gke_etcd_key_id
   }
 
-  # Layer 5: Workload Identity Federation Activation
-  workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
+  # Shielded Nodes
+  enable_shielded_nodes = true
+
+  # Release Channel & Maintenance
+  release_channel {
+    channel = "REGULAR"
   }
 
-  # Hardened Control Plane Maintenance Policy
   maintenance_policy {
     daily_maintenance_window {
       start_time = "03:00"
     }
   }
 
-  # Security & Compliance Features
-  release_channel {
-    channel = "REGULAR"
-  }
-
-  lifecycle {
-    ignore_changes = [
-      initial_node_count
-    ]
-  }
+  deletion_protection = true
 }
 
 # ------------------------------------------------------------------------------
-# 3. Node Pool 1: Standard System Workloads (Shielded Nodes)
+# 3. System Node Pool (Internal System Workloads)
 # ------------------------------------------------------------------------------
 resource "google_container_node_pool" "system_nodes" {
   name       = "system-node-pool"
+  project    = var.project_id
   location   = var.region
   cluster    = google_container_cluster.primary.name
-  project    = var.project_id
   node_count = 1
 
   autoscaling {
@@ -129,45 +129,44 @@ resource "google_container_node_pool" "system_nodes" {
   }
 
   node_config {
-    machine_type    = "e2-standard-4"
-    image_type      = "COS_CONTAINERD"
-    service_account = google_service_account.gke_nodes_sa.email
+    machine_type = "e2-standard-4"
+    image_type   = "COS_CONTAINERD"
+    disk_size_gb = 50
+    disk_type    = "pd-standard"
 
-    oauth_scopes = [
-      "https://www.googleapis.com/auth/cloud-platform"
-    ]
-
-    # Layer 6: CMEK Encrypted Boot Disks
+    # KMS CMEK Boot Disk Encryption
     boot_disk_kms_key = var.gke_disk_key_id
-    disk_size_gb      = 50
-    disk_type         = "pd-standard"
 
-    # Layer 3: Shielded Node Hardening
+    # Dedicated Least-Privilege SA
+    service_account = google_service_account.gke_nodes_sa.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    # Shielded VM Hardening
     shielded_instance_config {
       enable_secure_boot          = true
       enable_integrity_monitoring = true
-    }
-
-    # Security Metadata
-    metadata = {
-      disable-legacy-endpoints = "true"
     }
 
     labels = {
       "workload-tier" = "system"
     }
+
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
   }
 }
 
 # ------------------------------------------------------------------------------
-# 4. Node Pool 2: gVisor Sandboxed Workloads (Kernel Isolation)
+# 4. Sandbox Node Pool (gVisor MicroVM Workload Isolation)
 # ------------------------------------------------------------------------------
 resource "google_container_node_pool" "gvisor_nodes" {
-  provider   = google-beta
+  provider = google-beta
+
   name       = "gvisor-sandbox-pool"
+  project    = var.project_id
   location   = var.region
   cluster    = google_container_cluster.primary.name
-  project    = var.project_id
   node_count = 1
 
   autoscaling {
@@ -181,40 +180,31 @@ resource "google_container_node_pool" "gvisor_nodes" {
   }
 
   node_config {
-    machine_type    = "e2-standard-4"
-    image_type      = "COS_CONTAINERD"
-    service_account = google_service_account.gke_nodes_sa.email
+    machine_type = "e2-standard-4"
+    image_type   = "COS_CONTAINERD"
+    disk_size_gb = 50
+    disk_type    = "pd-standard"
 
-    oauth_scopes = [
-      "https://www.googleapis.com/auth/cloud-platform"
-    ]
-
-    # Layer 3: gVisor User-Space Sandbox Runtime
+    # Enable gVisor Sandbox Runtime (GKE manages sandbox.gke.io/runtime label and taint)
     sandbox_config {
       sandbox_type = "gvisor"
     }
 
-    # Layer 6: CMEK Encrypted Boot Disks
+    # KMS CMEK Boot Disk Encryption
     boot_disk_kms_key = var.gke_disk_key_id
-    disk_size_gb      = 50
-    disk_type         = "pd-standard"
 
-    # Layer 3: Shielded Node Hardening
+    # Dedicated Least-Privilege SA
+    service_account = google_service_account.gke_nodes_sa.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    # Shielded VM Hardening
     shielded_instance_config {
       enable_secure_boot          = true
       enable_integrity_monitoring = true
     }
 
-    # Taint to force untrusted/isolated workloads to explicitly tolerate gVisor
-    taint {
-      key    = "sandbox.gke.io/runtime"
-      value  = "gvisor"
-      effect = "NO_SCHEDULE"
-    }
-
     labels = {
-      "sandbox.gke.io/runtime" = "gvisor"
-      "workload-tier"          = "untrusted-unisolated"
+      "workload-tier" = "untrusted-unisolated"
     }
 
     metadata = {
