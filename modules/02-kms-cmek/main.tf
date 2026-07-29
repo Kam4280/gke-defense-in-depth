@@ -16,16 +16,18 @@ data "google_project" "project" {
 }
 
 # ------------------------------------------------------------------------------
-# 2. Service Identity Provisioning (Ensures Service Agents Exist)
+# 2. Enable Required APIs (Triggers Service Agent Creation in GCP)
 # ------------------------------------------------------------------------------
-resource "google_project_service_identity" "gke_sa" {
-  project = var.project_id
-  service = "container.googleapis.com"
+resource "google_project_service" "container_api" {
+  project            = var.project_id
+  service            = "container.googleapis.com"
+  disable_on_destroy = false
 }
 
-resource "google_project_service_identity" "compute_sa" {
-  project = var.project_id
-  service = "compute.googleapis.com"
+resource "google_project_service" "compute_api" {
+  project            = var.project_id
+  service            = "compute.googleapis.com"
+  disable_on_destroy = false
 }
 
 # ------------------------------------------------------------------------------
@@ -73,7 +75,11 @@ resource "google_kms_crypto_key" "gke_disk_key" {
 resource "google_kms_crypto_key_iam_member" "gke_etcd_encrypter_decrypter" {
   crypto_key_id = google_kms_crypto_key.gke_etcd_key.id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:${google_project_service_identity.gke_sa.email}"
+  member        = "serviceAccount:service-${data.google_project.project.number}@container-engine-robot.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service.container_api
+  ]
 }
 
 # ------------------------------------------------------------------------------
@@ -82,5 +88,9 @@ resource "google_kms_crypto_key_iam_member" "gke_etcd_encrypter_decrypter" {
 resource "google_kms_crypto_key_iam_member" "gke_disk_encrypter_decrypter" {
   crypto_key_id = google_kms_crypto_key.gke_disk_key.id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:${google_project_service_identity.compute_sa.email}"
+  member        = "serviceAccount:service-${data.google_project.project.number}@compute-system.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service.compute_api
+  ]
 }
