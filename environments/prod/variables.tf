@@ -1,10 +1,17 @@
 variable "project_id" {
   type        = string
-  description = "The target GCP Project ID for production infrastructure."
+  description = "Target GCP Project ID."
+  default     = "kam-dev-test"
 }
 
 variable "region" {
   type        = string
-  description = "The primary GCP region for resources."
+  description = "Target GCP Region."
   default     = "us-central1"
+}
+
+variable "cluster_name" {
+  type        = string
+  description = "Name for the production GKE cluster."
+  default     = "prod-gke-did-cluster"
 }

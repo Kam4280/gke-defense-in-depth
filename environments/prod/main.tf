@@ -5,6 +5,15 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 5.0"
     }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+  }
+
+  backend "gcs" {
+    bucket = "kam-dev-test-tfstate-gke-did"
+    prefix = "terraform/state/prod"
   }
 }
 
@@ -13,56 +22,47 @@ provider "google" {
   region  = var.region
 }
 
-# ------------------------------------------------------------------------------
-# 1. Tier 1 Network Module Call
-# ------------------------------------------------------------------------------
-module "vpc" {
-  source       = "../../modules/01-vpc-network"
-  project_id   = var.project_id
-  region       = var.region
-  network_name = "prod-gke-did-vpc"
-  subnet_name  = "prod-gke-did-subnet"
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
 }
 
 # ------------------------------------------------------------------------------
-# 2. Tier 1 Encryption Module Call (CMEK)
+# Module 01: Tier 1 VPC Network Foundation
 # ------------------------------------------------------------------------------
-module "kms" {
-  source       = "../../modules/02-kms-cmek"
-  project_id   = var.project_id
-  region       = var.region
-  keyring_name = "prod-gke-did-keyring"
+module "vpc_network" {
+  source     = "../../modules/01-vpc-network"
+  project_id = var.project_id
+  region     = var.region
 }
 
 # ------------------------------------------------------------------------------
-# Tier 1 Environment Outputs
+# Module 02: Tier 1 KMS CMEK Keyrings & Keys
 # ------------------------------------------------------------------------------
-output "network_id" {
-  value       = module.vpc.network_id
-  description = "The fully qualified URI of the production VPC network."
+module "kms_cmek" {
+  source     = "../../modules/02-kms-cmek"
+  project_id = var.project_id
+  region     = var.region
 }
 
-output "subnet_id" {
-  value       = module.vpc.subnet_id
-  description = "The fully qualified URI of the production subnet."
-}
+# ------------------------------------------------------------------------------
+# Module 03: Tier 2 Hardened Private GKE Cluster
+# ------------------------------------------------------------------------------
+module "gke_cluster" {
+  source                 = "../../modules/03-gke-cluster"
+  project_id             = var.project_id
+  region                 = var.region
+  cluster_name           = var.cluster_name
+  network_id             = module.vpc_network.network_id
+  subnet_id              = module.vpc_network.subnet_id
+  pod_ip_range_name      = module.vpc_network.pod_ip_range_name
+  svc_ip_range_name      = module.vpc_network.svc_ip_range_name
+  gke_etcd_key_id        = module.kms_cmek.gke_etcd_key_id
+  gke_disk_key_id        = module.kms_cmek.gke_disk_key_id
+  master_ipv4_cidr_block = "172.16.0.0/28"
 
-output "pod_ip_range_name" {
-  value       = module.vpc.pod_ip_range_name
-  description = "Secondary range identifier for Pod alias IPs."
-}
-
-output "svc_ip_range_name" {
-  value       = module.vpc.svc_ip_range_name
-  description = "Secondary range identifier for Service IPs."
-}
-
-output "gke_etcd_key_id" {
-  value       = module.kms.gke_etcd_key_id
-  description = "KMS Key URI for GKE etcd secret envelope encryption."
-}
-
-output "gke_disk_key_id" {
-  value       = module.kms.gke_disk_key_id
-  description = "KMS Key URI for GKE Persistent Disk volume encryption."
+  depends_on = [
+    module.vpc_network,
+    module.kms_cmek
+  ]
 }
