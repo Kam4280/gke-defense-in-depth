@@ -10,11 +10,6 @@ terraform {
       version = "~> 5.0"
     }
   }
-
-  backend "gcs" {
-    bucket = "kam-dev-test-tfstate-gke-did"
-    prefix = "terraform/state/prod"
-  }
 }
 
 provider "google" {
