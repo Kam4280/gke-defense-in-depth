@@ -9,14 +9,27 @@ terraform {
 }
 
 # ------------------------------------------------------------------------------
-# 1. Project Information Lookup (For Dynamic Service Account Construction)
+# 1. Project Information Lookup
 # ------------------------------------------------------------------------------
 data "google_project" "project" {
   project_id = var.project_id
 }
 
 # ------------------------------------------------------------------------------
-# 2. Cloud KMS KeyRing
+# 2. Service Identity Provisioning (Ensures Service Agents Exist)
+# ------------------------------------------------------------------------------
+resource "google_project_service_identity" "gke_sa" {
+  project = var.project_id
+  service = "container.googleapis.com"
+}
+
+resource "google_project_service_identity" "compute_sa" {
+  project = var.project_id
+  service = "compute.googleapis.com"
+}
+
+# ------------------------------------------------------------------------------
+# 3. Cloud KMS KeyRing
 # ------------------------------------------------------------------------------
 resource "google_kms_key_ring" "keyring" {
   name     = var.keyring_name
@@ -25,7 +38,7 @@ resource "google_kms_key_ring" "keyring" {
 }
 
 # ------------------------------------------------------------------------------
-# 3. CryptoKey for GKE etcd Secret Envelope Encryption
+# 4. CryptoKey for GKE etcd Secret Envelope Encryption
 # ------------------------------------------------------------------------------
 resource "google_kms_crypto_key" "gke_etcd_key" {
   name            = "gke-etcd-encryption-key"
@@ -35,12 +48,12 @@ resource "google_kms_crypto_key" "gke_etcd_key" {
   purpose = "ENCRYPT_DECRYPT"
 
   lifecycle {
-    prevent_destroy = false # Set to true in strictly production environments
+    prevent_destroy = false
   }
 }
 
 # ------------------------------------------------------------------------------
-# 4. CryptoKey for Persistent Node Disks / Stateful Volumes
+# 5. CryptoKey for Persistent Node Disks / Stateful Volumes
 # ------------------------------------------------------------------------------
 resource "google_kms_crypto_key" "gke_disk_key" {
   name            = "gke-disk-encryption-key"
@@ -55,19 +68,19 @@ resource "google_kms_crypto_key" "gke_disk_key" {
 }
 
 # ------------------------------------------------------------------------------
-# 5. IAM Grants: GKE Engine Service Agent (for etcd CMEK)
+# 6. IAM Grants: GKE Engine Service Agent (for etcd CMEK)
 # ------------------------------------------------------------------------------
 resource "google_kms_crypto_key_iam_member" "gke_etcd_encrypter_decrypter" {
   crypto_key_id = google_kms_crypto_key.gke_etcd_key.id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:service-${data.google_project.project.number}@container-engine-robot.iam.gserviceaccount.com"
+  member        = "serviceAccount:${google_project_service_identity.gke_sa.email}"
 }
 
 # ------------------------------------------------------------------------------
-# 6. IAM Grants: Compute Engine Service Agent (for Node Disk CMEK)
+# 7. IAM Grants: Compute Engine Service Agent (for Node Disk CMEK)
 # ------------------------------------------------------------------------------
 resource "google_kms_crypto_key_iam_member" "gke_disk_encrypter_decrypter" {
   crypto_key_id = google_kms_crypto_key.gke_disk_key.id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:service-${data.google_project.project.number}@compute-system.iam.gserviceaccount.com"
+  member        = "serviceAccount:${google_project_service_identity.compute_sa.email}"
 }
