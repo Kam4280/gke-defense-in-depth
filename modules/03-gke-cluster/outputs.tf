@@ -18,3 +18,7 @@ output "node_service_account_email" {
   value       = google_service_account.gke_nodes_sa.email
   description = "Email of the dynamic least-privilege node service account."
 }
+output "cluster_id" {
+  value       = google_container_cluster.primary.id
+  description = "The fully qualified resource ID of the GKE cluster."
+}

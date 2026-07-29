@@ -78,3 +78,17 @@ output "binauthz_attestor_name" {
   value       = module.binary_auth.attestor_name
   description = "The Binary Authorization attestor name."
 }
+# ------------------------------------------------------------------------------
+# Module 05: Tier 3 Cloud Service Mesh & Fleet Registration
+# ------------------------------------------------------------------------------
+module "cloud_service_mesh" {
+  source       = "../../modules/05-cloud-service-mesh"
+  project_id   = var.project_id
+  location     = var.region
+  cluster_name = var.cluster_name
+  cluster_id   = module.gke_cluster.cluster_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
