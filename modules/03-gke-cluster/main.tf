@@ -106,6 +106,16 @@ resource "google_container_cluster" "primary" {
   }
 
   deletion_protection = true
+
+  # ----------------------------------------------------------------------------
+  # PREVENT STATE DRIFT ERRORS
+  # ----------------------------------------------------------------------------
+  lifecycle {
+    ignore_changes = [
+      initial_node_count,
+      database_encryption[0].state
+    ]
+  }
 }
 
 # ------------------------------------------------------------------------------
