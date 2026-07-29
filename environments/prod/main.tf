@@ -61,3 +61,20 @@ module "gke_cluster" {
     module.kms_cmek
   ]
 }
+# ------------------------------------------------------------------------------
+# 3. Tier 2 Binary Authorization Module Call (Supply Chain Security)
+# ------------------------------------------------------------------------------
+module "binary_auth" {
+  source     = "../../modules/04-binary-auth"
+  project_id = var.project_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+# Output Binary Authorization Attestor Name
+output "binauthz_attestor_name" {
+  value       = module.binary_auth.attestor_name
+  description = "The Binary Authorization attestor name."
+}
