@@ -92,3 +92,15 @@ module "cloud_service_mesh" {
     module.gke_cluster
   ]
 }
+# ------------------------------------------------------------------------------
+# Module 06: Tier 4 Governance & OPA Gatekeeper (Policy Controller)
+# ------------------------------------------------------------------------------
+module "policy_gatekeeper" {
+  source        = "../../modules/06-policy-gatekeeper"
+  project_id    = var.project_id
+  membership_id = module.cloud_service_mesh.membership_id
+
+  depends_on = [
+    module.cloud_service_mesh
+  ]
+}
