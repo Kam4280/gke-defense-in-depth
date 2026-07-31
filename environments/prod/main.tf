@@ -104,3 +104,16 @@ module "policy_gatekeeper" {
     module.cloud_service_mesh
   ]
 }
+# ------------------------------------------------------------------------------
+# Module 07: Tier 5 SecOps Audit Logging & Log Sinks
+# ------------------------------------------------------------------------------
+module "secops_logging" {
+  source       = "../../modules/07-secops-logging"
+  project_id   = var.project_id
+  region       = var.region
+  cluster_name = var.cluster_name
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
