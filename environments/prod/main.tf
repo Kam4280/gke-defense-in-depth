@@ -21,6 +21,13 @@ provider "google-beta" {
   project = var.project_id
   region  = var.region
 }
+data "google_client_config" "default" {}
+
+provider "kubernetes" {
+  host                   = "https://${module.gke_cluster.cluster_endpoint}"
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(module.gke_cluster.cluster_ca_certificate)
+}
 
 # ------------------------------------------------------------------------------
 # Module 01: Tier 1 VPC Network Foundation
@@ -116,4 +123,21 @@ module "secops_logging" {
   depends_on = [
     module.gke_cluster
   ]
+}
+# ------------------------------------------------------------------------------
+# Module 08: Tier 6 Sandboxed MLOps Workload Deployment
+# ------------------------------------------------------------------------------
+module "mlops_inference" {
+  source       = "../../modules/08-mlops-inference"
+  project_id   = var.project_id
+  cluster_name = var.cluster_name
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+output "mlops_namespace" {
+  value       = module.mlops_inference.namespace
+  description = "The namespace of the deployed sandboxed MLOps workload."
 }
