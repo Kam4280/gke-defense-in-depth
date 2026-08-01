@@ -29,7 +29,7 @@ resource "kubernetes_namespace" "mlops" {
     name = var.namespace
     labels = {
       "pod-security.kubernetes.io/enforce" = "restricted"
-      "istio-injection"                    = "enabled"
+      "istio-injection"                    = "disabled"
     }
   }
 }
@@ -81,6 +81,9 @@ resource "kubernetes_deployment_v1" "mlops_inference" {
           app  = "mlops-model-server"
           tier = "inference"
         }
+        annotations = {
+          "sidecar.istio.io/inject" = "false"
+        }
       }
 
       spec {
@@ -91,7 +94,7 @@ resource "kubernetes_deployment_v1" "mlops_inference" {
 
         # Direct placement onto gVisor Node Pool
         node_selector = {
-          "workload-tier" = "untrusted-unisolated"
+          "sandbox.gke.io/runtime" = "gvisor"
         }
 
         toleration {
@@ -101,12 +104,16 @@ resource "kubernetes_deployment_v1" "mlops_inference" {
           effect   = "NoSchedule"
         }
 
-        # Pod Security Context
+        # Pod-level Security Context
         security_context {
           run_as_non_root = true
           run_as_user     = 10001
           run_as_group    = 10001
           fs_group        = 10001
+
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
         }
 
         container {
@@ -124,11 +131,19 @@ resource "kubernetes_deployment_v1" "mlops_inference" {
             }
           }
 
+          # Container-level Security Context
           security_context {
+            run_as_non_root            = true
+            run_as_user                = 10001
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
+
             capabilities {
               drop = ["ALL"]
+            }
+
+            seccomp_profile {
+              type = "RuntimeDefault"
             }
           }
 
