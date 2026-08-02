@@ -63,12 +63,16 @@ resource "google_binary_authorization_attestor" "attestor" {
 resource "google_binary_authorization_policy" "policy" {
   project = var.project_id
 
-  # Automatically allow Google-signed system images (Cilium, DNS, gVisor helper pods)
+  # Allow Google-signed system images
   global_policy_evaluation_mode = "ENABLE"
 
+  # Enforce strict attestation requirements
   default_admission_rule {
-    evaluation_mode  = "ALWAYS_ALLOW" # Swapped to REQUIRE_ATTESTATION in strict enforcement pipelines
+    evaluation_mode  = "REQUIRE_ATTESTATION"
     enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+    require_attestations_by = [
+      google_binary_authorization_attestor.attestor.name # <--- Fixed resource name reference
+    ]
   }
 
   depends_on = [
