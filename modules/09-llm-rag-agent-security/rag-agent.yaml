@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-agent-app
+  namespace: mlops-secops
+  labels:
+    app.kubernetes.io/name: rag-agent
+    app.kubernetes.io/component: inference-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rag-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rag-agent
+    spec:
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      serviceAccountName: rag-agent-k8s-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-agent
+          image: python:3.11-slim
+          command:
+            - python
+            - -c
+            - |
+              import http.server
+              import socketserver
+              import json
+
+              class RAGHandler(http.server.SimpleHTTPRequestHandler):
+                  def do_POST(self):
+                      content_length = int(self.headers['Content-Length'])
+                      post_data = self.rfile.read(content_length)
+                      print(f"[RAG AGENT] Received Prompt Data: {post_data.decode('utf-8')}")
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      response = {"status": "processed", "layer_isolation": "gvisor-runsc"}
+                      self.wfile.write(json.dumps(response).encode('utf-8'))
+
+              PORT = 8080
+              with socketserver.TCPServer(("", PORT), RAGHandler) as httpd:
+                  print(f"RAG Agent Serving on Port {PORT}")
+                  httpd.serve_forever()
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-agent-service
+  namespace: mlops-secops
+spec:
+  selector:
+    app.kubernetes.io/name: rag-agent
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
