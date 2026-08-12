@@ -141,3 +141,19 @@ output "mlops_namespace" {
   value       = module.mlops_inference.namespace
   description = "The namespace of the deployed sandboxed MLOps workload."
 }
+# ------------------------------------------------------------------------------
+# Module 09: Phase 2 LLM Agent & RAG Security Sandbox
+# ------------------------------------------------------------------------------
+module "llm_rag_security" {
+  source     = "../../modules/09-llm-rag-agent-security"
+  project_id = var.project_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+output "llm_rag_namespace" {
+  value       = module.llm_rag_security.mlops_secops_namespace
+  description = "The namespace of the deployed LLM Agent & RAG security sandbox."
+}
