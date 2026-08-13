@@ -45,8 +45,12 @@ spec:
           volumeMounts:
             - name: qdrant-storage
               mountPath: /qdrant/storage
+            - name: qdrant-snapshots
+              mountPath: /qdrant/snapshots
       volumes:
         - name: qdrant-storage
+          emptyDir: {}
+        - name: qdrant-snapshots
           emptyDir: {}
 ---
 apiVersion: v1
