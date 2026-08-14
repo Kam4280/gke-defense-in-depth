@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-agent-egress-policy
+  namespace: mlops-secops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rag-agent
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Allow DNS Resolution (Port 53 UDP/TCP for internal K8s service name lookups)
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # 2. Allow Internal Access to Qdrant Vector DB on TCP Port 6333 ONLY
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: qdrant-vectordb
+      ports:
+        - protocol: TCP
+          port: 6333

