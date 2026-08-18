@@ -10,14 +10,14 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # 1. Allow DNS Resolution (Port 53 UDP/TCP for internal K8s service name lookups)
+    # 1. Allow DNS Resolution (Port 53 UDP/TCP)
     - ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
 
-    # 2. Allow Internal Access to Qdrant Vector DB on TCP Port 6333 ONLY
+    # 2. Allow Internal Access to Qdrant Vector DB (TCP Port 6333)
     - to:
         - podSelector:
             matchLabels:
@@ -25,3 +25,11 @@ spec:
       ports:
         - protocol: TCP
           port: 6333
+
+    # 3. Allow GKE Workload Identity Metadata Server Access (169.254.169.254:80)
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
